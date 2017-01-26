@@ -1,20 +1,19 @@
 import logging
 import os
-import time
 
 from scrapy.http import Request
 from scrapy.item import BaseItem
 from scrapy.utils.request import request_fingerprint
-from scrapy.utils.project import data_path
 from scrapy.utils.python import to_bytes
 from scrapy.exceptions import NotConfigured
 from scrapy import signals
 
+from redis.client import StrictRedis
 
 logger = logging.getLogger(__name__)
 
 
-class DeltaFetch(object):
+class DeltaFetchRedis(object):
     """
     This is a spider middleware to ignore requests to pages containing items
     seen in previous crawls of the same spider, thus producing a "delta crawl"
@@ -25,14 +24,9 @@ class DeltaFetch(object):
     intensive).
     """
 
-    def __init__(self, dir, reset=False, stats=None):
-        dbmodule = None
-        try:
-            dbmodule = __import__('bsddb3').db
-        except ImportError:
-            raise NotConfigured('bsddb3 is required')
-        self.dbmodule = dbmodule
-        self.dir = dir
+    def __init__(self, conn_url, reset=False, stats=None):
+        self.db = None
+        self.conn_url = conn_url
         self.reset = reset
         self.stats = stats
 
@@ -41,49 +35,40 @@ class DeltaFetch(object):
         s = crawler.settings
         if not s.getbool('DELTAFETCH_ENABLED'):
             raise NotConfigured
-        dir = data_path(s.get('DELTAFETCH_DIR', 'deltafetch'))
+        if not s.get('DELTAFETCH_REDIS_URL'):
+            raise NotConfigured
+        conn_url = s.get('DELTAFETCH_REDIS_URL')
         reset = s.getbool('DELTAFETCH_RESET')
-        o = cls(dir, reset, crawler.stats)
+        o = cls(conn_url, reset, crawler.stats)
+
         crawler.signals.connect(o.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(o.spider_closed, signal=signals.spider_closed)
         return o
 
     def spider_opened(self, spider):
-        if not os.path.exists(self.dir):
-            os.makedirs(self.dir)
-        dbpath = os.path.join(self.dir, '%s.db' % spider.name)
+        self.dbkey = 'deltafetch.redis.%s' % spider.name
         reset = self.reset or getattr(spider, 'deltafetch_reset', False)
-        flag = self.dbmodule.DB_TRUNCATE if reset else self.dbmodule.DB_CREATE
-        try:
-            self.db = self.dbmodule.DB()
-            self.db.open(filename=dbpath,
-                         dbtype=self.dbmodule.DB_HASH,
-                         flags=flag)
-        except Exception:
-            logger.warning("Failed to open DeltaFetch database at %s, "
-                           "trying to recreate it" % dbpath)
-            if os.path.exists(dbpath):
-                os.remove(dbpath)
-            self.db = self.dbmodule.DB()
-            self.db.open(filename=dbpath,
-                         dbtype=self.dbmodule.DB_HASH,
-                         flags=self.dbmodule.DB_CREATE)
+
+        self.db = StrictRedis.from_url(self.conn_url)
+        assert self.db.echo("test") == "test", "Connection failed"
+        if reset:
+            self.db.delete(self.dbkey)
 
     def spider_closed(self, spider):
-        self.db.close()
+        self.db.bgsave()
 
     def process_spider_output(self, response, result, spider):
         for r in result:
             if isinstance(r, Request):
                 key = self._get_key(r)
-                if key in self.db:
+                if self.db.sismember(self.dbkey, key):
                     logger.info("Ignoring already visited: %s" % r)
                     if self.stats:
                         self.stats.inc_value('deltafetch/skipped', spider=spider)
                     continue
             elif isinstance(r, (BaseItem, dict)):
                 key = self._get_key(response.request)
-                self.db[key] = str(time.time())
+                self.db.sadd(self.dbkey, key)
                 if self.stats:
                     self.stats.inc_value('deltafetch/stored', spider=spider)
             yield r

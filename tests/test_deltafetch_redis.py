@@ -13,7 +13,7 @@ from scrapy.utils.python import to_bytes
 from scrapy.statscollectors import StatsCollector
 from scrapy.utils.test import get_crawler
 
-from scrapy_deltafetch.middleware import DeltaFetch
+from scrapy_deltafetch_redis.middleware import DeltaFetchRedis
 
 
 dbmodule = None
